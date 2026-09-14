@@ -1,0 +1,83 @@
+name: Check iOS prototype
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-check
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand initial source package once
+        id: source
+        shell: bash
+        run: |
+          if [ ! -d Sources ]; then
+            python3 - <<'PY'
+          import hashlib, pathlib, zipfile
+          archive = pathlib.Path('MonsterHunt-prototype.zip')
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == '0b8b249979eb1825be697ab816684267c4066398c5060a74f8c24a53bce7dd9c'
+          allowed = {'Sources', 'Tests', 'tools', 'MonsterHunt.xcodeproj'}
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  p = pathlib.PurePosixPath(item.filename)
+                  if len(p.parts) < 3 or p.parts[0] != 'MonsterHunt' or p.parts[1] not in allowed:
+                      continue
+                  assert '..' not in p.parts and not p.is_absolute()
+                  target = pathlib.Path(*p.parts[1:])
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(z.read(item))
+          PY
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add Sources Tests tools MonsterHunt.xcodeproj
+            git commit -m 'Expand initial AR prototype sources and Xcode project'
+            git push
+          fi
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  check:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+      - name: Generate Xcode project
+        run: python3 tools/generate_project.py
+      - name: Compile for physical iPhone without signing
+        run: >-
+          xcodebuild -project MonsterHunt.xcodeproj -scheme MonsterHunt
+          -destination 'generic/platform=iOS' -derivedDataPath build/device
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Choose an available iPhone simulator
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          data = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '-j']))
+          devices = [d for runtime, ds in data['devices'].items() if 'iOS' in runtime for d in ds if 'iPhone' in d['name']]
+          if not devices:
+              raise SystemExit('No available iPhone simulator')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('SIMULATOR_ID=' + devices[0]['udid'] + '\n')
+          PY
+      - name: Test rules and persistence
+        run: >-
+          xcodebuild -project MonsterHunt.xcodeproj -scheme MonsterHunt
+          -destination "platform=iOS Simulator,id=$SIMULATOR_ID"
+          -derivedDataPath build/simulator -resultBundlePath build/Tests.xcresult
+          CODE_SIGNING_ALLOWED=NO test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-check-results
+          path: build/Tests.xcresult
+          retention-days: 3
