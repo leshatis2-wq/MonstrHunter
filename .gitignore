@@ -1,0 +1,9 @@
+DerivedData/
+build/
+xcuserdata/
+*.xcworkspace/
+*.p12
+*.mobileprovision
+.DS_Store
+__pycache__/
+*.pyc
